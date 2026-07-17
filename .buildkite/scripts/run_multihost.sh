@@ -208,14 +208,6 @@ wait_for_server() {
 PROJECT="$(gcloud config get-value project)"
 GCR_REPO="us-central1-docker.pkg.dev/${PROJECT}/tpu-inference"
 
-# Determine the Docker image name and registry path.
-# Use the local image for multi-host benchmarks; otherwise, default to the remote GCR image.
-if [[ "$IS_MULTI_HOST_BENCH" == "true" ]]; then
-  IMAGE_NAME='vllm-tpu'
-else 
-  IMAGE_NAME="${GCR_REPO}/vllm-tpu"
-fi
-
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 TOP_DIR=$(dirname "$(dirname "$SCRIPT_DIR")")
 
@@ -227,11 +219,15 @@ docker system prune -a --volumes -f || true
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/setup_docker_env.sh"
 
+# Determine the Docker image name and registry path.
+# Use the local image for multi-host benchmarks; otherwise, default to the remote GCR image.
 if [[ "$IS_MULTI_HOST_BENCH" == "true" ]]; then
+  IMAGE_NAME='vllm-tpu'
   setup_environment "$IMAGE_NAME"
   # Use the exported CI cache image path so Worker Nodes can pull it directly
   DOCKER_IMAGE="${EXPORTED_CI_CACHE_IMAGE:-$IMAGE_NAME:latest}"
 else
+  IMAGE_NAME="${GCR_REPO}/vllm-tpu"
   # Pass "true" to enable pushing to GCR
   setup_environment "${IMAGE_NAME}" "true"
   DOCKER_IMAGE="${IMAGE_NAME}:${BUILDKITE_COMMIT:-latest}"

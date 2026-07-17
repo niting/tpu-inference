@@ -6,7 +6,7 @@
     "GCP_DATABASE_ID": "vllm-bm-bk-runs",
     "RUN_ONCE": "true",
     "IS_MULTI_HOST_BENCH": true,
-    "bk_timeout_in_minutes": 180
+    "BK_TIMEOUT_IN_MINUTES": 180
   },
   "benchmark_cases": [
     {

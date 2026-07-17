@@ -233,7 +233,7 @@ def create_benchmark_steps(case_data: Dict[str, Any],
             "TPU_VERSION": tpu_version,
         }
 
-        timeout_in_minutes = step_env.pop("bk_timeout_in_minutes", None)
+        timeout_in_minutes = step_env.pop("BK_TIMEOUT_IN_MINUTES", None)
 
         step_env["TARGET_CASE_NAME"] = case_name
         # Include parent_dir in label for uniqueness

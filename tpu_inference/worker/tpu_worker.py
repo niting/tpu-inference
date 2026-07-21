@@ -27,8 +27,9 @@ from tpu_inference.distributed import jax_parallel_state
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
 from tpu_inference.distributed.utils import (get_device_topology_order_id,
                                              get_host_ip, get_kv_transfer_port)
-from tpu_inference.distributed.weight_transfer import \
-    WeightTransferWorkerMixin
+from tpu_inference.distributed.weight_transfer import (COLOCATED, RAIDEN,
+                                                       ParamMeta,
+                                                       WeightUpdateRequest)
 from tpu_inference.layers.common.sharding import ShardingConfigManager
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.jax_intermediate_tensor import \
@@ -178,7 +179,13 @@ def _parse_profile_options(
     return standard_opts, advanced_opts
 
 
-class TPUWorker(WeightTransferWorkerMixin, WorkerBase):
+class TPUWorker(WorkerBase):
+
+    # Weight-update session state. Class-level so the attributes exist even
+    # when no RL framework ever calls the weight-update API.
+    _weight_update_active: bool = False
+    _kv_cache_freed: bool = False
+    _weight_transfer_defaults: Optional[WeightUpdateRequest] = None
 
     def __init__(
         self,
@@ -660,9 +667,6 @@ class TPUWorker(WeightTransferWorkerMixin, WorkerBase):
 
     def load_model(self) -> None:
         self.model_runner.load_model()
-        # Built after the weights exist, so a backend can bind to the live
-        # arrays. No-op unless weight_transfer_config is set.
-        self.init_weight_transfer()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         self.model_runner.capture_model()
@@ -734,25 +738,114 @@ class TPUWorker(WeightTransferWorkerMixin, WorkerBase):
     ) -> None:
         """Sync the updated weights to the model runner.
 
-        Predates vLLM's native weight-update API. Prefer
-        `start_weight_update` / `update_weights` / `finish_weight_update`
-        (see `tpu_inference/distributed/weight_transfer/`), which handle the
-        KV-cache lifecycle for you and work with non-colocated trainers.
+        Predates vLLM's weight-update API. Prefer `start_weight_update` /
+        `update_weights` / `finish_weight_update` below, which handle the
+        KV-cache lifecycle and can also pull from an out-of-process trainer.
         """
         return self.model_runner._sync_weights(updated_weights=updated_weights,
                                                mappings=mappings,
                                                transpose_keys=transpose_keys,
                                                reshard_fn=reshard_fn)
 
+    # vLLM's weight-update API. The method names matter: `collective_rpc`
+    # dispatches to workers by name, so implementing them here is enough for
+    # `LLM`/`AsyncLLM`, the engine core, the executors and the weight-update
+    # HTTP routes to drive a TPU sampler unmodified. (vLLM defines them on
+    # `gpu_worker.Worker`, which `TPUWorker` does not inherit from.)
+
+    def get_weight_metadata(self) -> Dict[str, ParamMeta]:
+        """Describe this sampler's weights so a trainer can target them."""
+        return self.model_runner.get_weight_metadata()
+
+    def init_weight_transfer_engine(self, init_info: Dict[str, Any]) -> None:
+        """Set session defaults and open the transport.
+
+        Optional for the colocated path -- supplying `mappings` and
+        `transpose_keys` once here just saves repeating them on every chunk.
+        """
+        defaults = WeightUpdateRequest.from_dict(init_info)
+        if defaults.transport == RAIDEN:
+            raise NotImplementedError(
+                "Raiden weight transport is not implemented yet; see "
+                "docs/developer_guides/rl_weight_sync.md.")
+        self._weight_transfer_defaults = defaults
+
+    def start_weight_update(self, free_kv_cache: bool = True) -> None:
+        """Open a weight update session.
+
+        Args:
+            free_kv_cache: Drop the KV cache before the transfer. On by
+                default because receiving a full set of weights roughly
+                doubles peak HBM, and because decoding from KV computed under
+                the old weights is incorrect. `finish_weight_update`
+                reallocates it. Pass False if the caller already freed it.
+
+        The prefix cache lives on the scheduler, not the worker, so callers
+        must also call `reset_prefix_cache()` on the engine.
+        """
+        if self._weight_update_active:
+            raise RuntimeError(
+                "start_weight_update called while an update is already "
+                "active. Call finish_weight_update first.")
+        if free_kv_cache:
+            self.model_runner.delete_kv_cache()
+            self._kv_cache_freed = True
+        self._weight_update_active = True
+
+    def update_weights(self, update_info: Dict[str, Any]) -> None:
+        """Receive one chunk of weights.
+
+        May be called repeatedly within a session for chunked transfers.
+        """
+        if not self._weight_update_active:
+            raise RuntimeError(
+                "start_weight_update must be called before update_weights.")
+
+        request = WeightUpdateRequest.from_dict(update_info).with_defaults(
+            self._weight_transfer_defaults)
+        try:
+            transport = request.transport
+            if transport == COLOCATED:
+                self.model_runner._sync_weights(
+                    updated_weights=request.weights,
+                    mappings=request.mappings or {},
+                    transpose_keys=request.transpose_keys or {},
+                    reshard_fn=request.reshard_fn)
+            elif transport == RAIDEN:
+                raise NotImplementedError(
+                    "Raiden weight transport is not implemented yet; see "
+                    "docs/developer_guides/rl_weight_sync.md.")
+            else:
+                raise ValueError(
+                    "Weight update specified no source: set 'weights' for a "
+                    "colocated trainer or 'source_endpoints' for Raiden.")
+            # Transfers may be asynchronous; the next forward pass must not
+            # race the write.
+            jax.block_until_ready(self.model_runner.state_leaves)
+        except BaseException:
+            # Some chunks may have landed, so the model is in an unknown
+            # state. End the session rather than let the caller keep
+            # streaming into it; finish_weight_update still restores HBM.
+            self._weight_update_active = False
+            raise
+
+    def finish_weight_update(self) -> None:
+        """Close the session and restore serving state.
+
+        Deliberately tolerant of there being no active session: a failed
+        `update_weights` ends the session but leaves the KV cache freed, and
+        this is the call that puts it back.
+        """
+        self._weight_update_active = False
+        if self._kv_cache_freed:
+            self.model_runner.reinitialize_kv_cache()
+            self._kv_cache_freed = False
+
     def delete_kv_cache(self) -> None:
         self.model_runner.delete_kv_cache()
 
     def reinitialize_kv_cache(self) -> None:
         self.model_runner.reinitialize_kv_cache()
-
-    def shutdown(self) -> None:
-        self.shutdown_weight_transfer()
-        super().shutdown()
 
     def add_lora(self, lora_request: Any) -> bool:
         return self.model_runner.add_lora(lora_request)

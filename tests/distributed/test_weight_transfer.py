@@ -1,70 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the JAX weight transfer contract and worker state machine.
+"""Unit tests for the RL weight-update API on TPUWorker.
 
-These exercise the session bookkeeping and the registry against fakes; they
-need no TPU and no model.
+Exercises the session state machine and payload handling against a fake model
+runner; needs no TPU and no model.
 """
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock
+import pickle
+from typing import Any, Dict, List
 
 import jax
 import jax.numpy as jnp
 import pytest
 
-from tpu_inference.distributed.weight_transfer import factory
-from tpu_inference.distributed.weight_transfer.base import (
-    JaxWeightTransferEngine, ParamMeta, WeightTransferInitInfo,
-    WeightTransferUpdateInfo)
-from tpu_inference.distributed.weight_transfer.jax_local_engine import (
-    JaxLocalUpdateInfo, JaxLocalWeightTransferEngine)
-from tpu_inference.distributed.weight_transfer.worker_mixin import \
-    WeightTransferWorkerMixin
-
-
-@dataclass
-class _FakeInitInfo(WeightTransferInitInfo):
-    channel: str = "default"
-
-
-@dataclass
-class _FakeUpdateInfo(WeightTransferUpdateInfo):
-    payload: Any = None
-
-
-class _FakeEngine(JaxWeightTransferEngine):
-    """Records lifecycle calls so tests can assert ordering."""
-
-    init_info_cls = _FakeInitInfo
-    update_info_cls = _FakeUpdateInfo
-
-    def __init__(self, config=None, vllm_config=None, runner=None):
-        super().__init__(config, vllm_config, runner)
-        self.calls: List[str] = []
-        self.received: List[Any] = []
-        self.fail_on_start = False
-        self.fail_on_receive = False
-
-    def init_transfer_engine(self, init_info):
-        self.calls.append(f"init:{init_info.channel}")
-
-    def start_weight_update(self):
-        if self.fail_on_start:
-            raise RuntimeError("start boom")
-        self.calls.append("start")
-
-    def receive_weights(self, update_info):
-        if self.fail_on_receive:
-            raise RuntimeError("receive boom")
-        self.calls.append("receive")
-        self.received.append(update_info.payload)
-
-    def finish_weight_update(self):
-        self.calls.append("finish")
-
-    def shutdown(self):
-        self.calls.append("shutdown")
+from tpu_inference.distributed.weight_transfer import (COLOCATED, RAIDEN,
+                                                       ParamMeta,
+                                                       WeightUpdateRequest)
+from tpu_inference.worker.tpu_worker import TPUWorker
 
 
 class _FakeRunner:
@@ -74,6 +25,7 @@ class _FakeRunner:
         self.state_leaves = (jnp.zeros((2, 2)), )
         self.kv_events: List[str] = []
         self.sync_calls: List[Dict[str, Any]] = []
+        self.fail_on_sync = False
 
     def delete_kv_cache(self):
         self.kv_events.append("delete")
@@ -82,19 +34,12 @@ class _FakeRunner:
         self.kv_events.append("reinit")
 
     def _sync_weights(self, **kwargs):
+        if self.fail_on_sync:
+            raise RuntimeError("sync boom")
         self.sync_calls.append(kwargs)
 
     def get_weight_metadata(self):
         return {"w": ParamMeta(shape=(2, 2), dtype="float32")}
-
-
-class _FakeWorker(WeightTransferWorkerMixin):
-
-    def __init__(self, engine: Optional[JaxWeightTransferEngine],
-                 runner: _FakeRunner):
-        self.vllm_config = MagicMock()
-        self.model_runner = runner
-        self.weight_transfer_engine = engine
 
 
 @pytest.fixture
@@ -103,29 +48,36 @@ def runner():
 
 
 @pytest.fixture
-def engine(runner):
-    return _FakeEngine(runner=runner)
+def worker(runner):
+    """A TPUWorker with only the attributes the weight-update API touches.
 
-
-@pytest.fixture
-def worker(engine, runner):
-    return _FakeWorker(engine, runner)
+    `TPUWorker.__init__` stands up devices and a model runner, so bypass it.
+    """
+    w = TPUWorker.__new__(TPUWorker)
+    w.model_runner = runner
+    return w
 
 
 # --- happy path -------------------------------------------------------------
 
 
-def test_full_update_cycle_calls_engine_in_order(worker, engine):
-    worker.init_weight_transfer_engine({"channel": "nccl-ish"})
+def test_full_update_cycle(worker, runner):
     worker.start_weight_update()
-    worker.update_weights({"payload": "chunk0"})
-    worker.update_weights({"payload": "chunk1"})
+    worker.update_weights({"weights": "STATE"})
     worker.finish_weight_update()
 
-    assert engine.calls == [
-        "init:nccl-ish", "start", "receive", "receive", "finish"
-    ]
-    assert engine.received == ["chunk0", "chunk1"]
+    assert len(runner.sync_calls) == 1
+    assert runner.sync_calls[0]["updated_weights"] == "STATE"
+    assert worker._weight_update_active is False
+
+
+def test_chunked_update_applies_every_chunk(worker, runner):
+    worker.start_weight_update()
+    worker.update_weights({"weights": "CHUNK0"})
+    worker.update_weights({"weights": "CHUNK1"})
+    worker.finish_weight_update()
+    assert [c["updated_weights"]
+            for c in runner.sync_calls] == ["CHUNK0", "CHUNK1"]
 
 
 def test_kv_cache_is_freed_and_restored(worker, runner):
@@ -144,10 +96,48 @@ def test_free_kv_cache_can_be_disabled(worker, runner):
 def test_multiple_sequential_sessions(worker, runner):
     for _ in range(3):
         worker.start_weight_update()
-        worker.update_weights({"payload": None})
+        worker.update_weights({"weights": "STATE"})
         worker.finish_weight_update()
     assert runner.kv_events == ["delete", "reinit"] * 3
-    assert worker._weight_update_active is False
+
+
+def test_init_supplies_session_defaults(worker, runner):
+    worker.init_weight_transfer_engine({
+        "mappings": {
+            "a": ("b", ("model", ))
+        },
+        "transpose_keys": {
+            "kernel": (1, 0)
+        },
+    })
+    worker.start_weight_update()
+    worker.update_weights({"weights": "STATE"})
+
+    call = runner.sync_calls[0]
+    assert call["mappings"] == {"a": ("b", ("model", ))}
+    assert call["transpose_keys"] == {"kernel": (1, 0)}
+    assert call["reshard_fn"] is None
+
+
+def test_per_chunk_fields_override_defaults(worker, runner):
+    worker.init_weight_transfer_engine({"mappings": {"a": ("b", ())}})
+    worker.start_weight_update()
+    worker.update_weights({"weights": "STATE", "mappings": {"c": ("d", ())}})
+    assert runner.sync_calls[0]["mappings"] == {"c": ("d", ())}
+
+
+def test_reshard_fn_is_forwarded(worker, runner):
+    fn = lambda src, tgt: src
+    worker.start_weight_update()
+    worker.update_weights({"weights": "STATE", "reshard_fn": fn})
+    assert runner.sync_calls[0]["reshard_fn"] is fn
+
+
+def test_init_is_optional(worker, runner):
+    """The colocated path works without ever calling init."""
+    worker.start_weight_update()
+    worker.update_weights({"weights": "STATE"})
+    assert runner.sync_calls[0]["mappings"] == {}
 
 
 # --- error handling ---------------------------------------------------------
@@ -155,7 +145,7 @@ def test_multiple_sequential_sessions(worker, runner):
 
 def test_update_without_start_raises(worker):
     with pytest.raises(RuntimeError, match="start_weight_update must be"):
-        worker.update_weights({"payload": None})
+        worker.update_weights({"weights": "STATE"})
 
 
 def test_double_start_raises(worker):
@@ -164,31 +154,27 @@ def test_double_start_raises(worker):
         worker.start_weight_update()
 
 
-def test_unconfigured_worker_raises_helpful_error(runner):
-    worker = _FakeWorker(engine=None, runner=runner)
-    with pytest.raises(RuntimeError, match="not configured"):
-        worker.start_weight_update()
-
-
-def test_failed_start_restores_kv_cache(worker, engine, runner):
-    engine.fail_on_start = True
-    with pytest.raises(RuntimeError, match="start boom"):
-        worker.start_weight_update()
-    # HBM must be back to a serving state, and no session left dangling.
-    assert runner.kv_events == ["delete", "reinit"]
-    assert worker._weight_update_active is False
-
-
-def test_failed_receive_ends_session_and_finish_restores_kv(
-        worker, engine, runner):
-    engine.fail_on_receive = True
+def test_update_without_a_source_raises(worker):
     worker.start_weight_update()
-    with pytest.raises(RuntimeError, match="receive boom"):
-        worker.update_weights({"payload": None})
+    with pytest.raises(ValueError, match="no source"):
+        worker.update_weights({"mappings": {}})
+
+
+def test_unknown_field_raises(worker):
+    worker.start_weight_update()
+    with pytest.raises(ValueError, match="Unknown weight update field"):
+        worker.update_weights({"weights": "STATE", "nonsense": 1})
+
+
+def test_failed_sync_ends_session_and_finish_restores_kv(worker, runner):
+    runner.fail_on_sync = True
+    worker.start_weight_update()
+    with pytest.raises(RuntimeError, match="sync boom"):
+        worker.update_weights({"weights": "STATE"})
     assert worker._weight_update_active is False
     # Further chunks are refused rather than silently applied.
     with pytest.raises(RuntimeError, match="start_weight_update must be"):
-        worker.update_weights({"payload": None})
+        worker.update_weights({"weights": "STATE"})
     worker.finish_weight_update()
     assert runner.kv_events == ["delete", "reinit"]
 
@@ -197,114 +183,63 @@ def test_finish_is_idempotent_for_kv_cache(worker, runner):
     worker.start_weight_update()
     worker.finish_weight_update()
     worker.finish_weight_update()
-    # The cache is reallocated exactly once.
     assert runner.kv_events.count("reinit") == 1
 
 
-def test_invalid_init_info_raises_value_error(worker):
-    with pytest.raises(ValueError, match="Invalid init_info"):
-        worker.init_weight_transfer_engine({"not_a_field": 1})
+# --- raiden path ------------------------------------------------------------
 
 
-def test_invalid_update_info_raises_value_error(worker):
+def test_raiden_transport_is_recognised_but_unimplemented(worker):
     worker.start_weight_update()
-    with pytest.raises(ValueError, match="Invalid update_info"):
-        worker.update_weights({"not_a_field": 1})
+    with pytest.raises(NotImplementedError, match="Raiden"):
+        worker.update_weights({"source_endpoints": ["10.0.0.1:9200"]})
 
 
-# --- registry ---------------------------------------------------------------
+def test_raiden_init_is_recognised_but_unimplemented(worker):
+    with pytest.raises(NotImplementedError, match="Raiden"):
+        worker.init_weight_transfer_engine(
+            {"source_endpoints": ["10.0.0.1:9200"]})
 
 
-def test_builtin_backend_is_registered():
-    assert factory.get_engine_cls("jax_local") is JaxLocalWeightTransferEngine
+def test_both_sources_set_is_rejected(worker):
+    worker.start_weight_update()
+    with pytest.raises(ValueError, match="not both"):
+        worker.update_weights({
+            "weights": "STATE",
+            "source_endpoints": ["10.0.0.1:9200"]
+        })
 
 
-def test_unknown_backend_lists_registered_names():
-    with pytest.raises(ValueError, match="jax_local"):
-        factory.get_engine_cls("does-not-exist")
+# --- request type -----------------------------------------------------------
 
 
-def test_register_and_create_custom_backend(runner):
-    factory.register_engine("test_fake", _FakeEngine)
-    vllm_config = MagicMock()
-    vllm_config.weight_transfer_config.backend = "test_fake"
-    created = factory.create_engine(vllm_config=vllm_config, runner=runner)
-    assert isinstance(created, _FakeEngine)
-    assert created.runner is runner
+def test_transport_detection():
+    assert WeightUpdateRequest(weights="S").transport == COLOCATED
+    assert WeightUpdateRequest(source_endpoints=["a:1"]).transport == RAIDEN
+    assert WeightUpdateRequest().transport is None
 
 
-def test_register_rejects_non_engine():
-    with pytest.raises(TypeError):
-        factory.register_engine("bad", dict)
+def test_with_defaults_only_fills_unset_fields():
+    defaults = WeightUpdateRequest(mappings={"a": ("b", ())},
+                                   transpose_keys={"k": (1, 0)})
+    merged = WeightUpdateRequest(weights="S", mappings={
+        "c": ("d", ())
+    }).with_defaults(defaults)
+    assert merged.weights == "S"
+    assert merged.mappings == {"c": ("d", ())}
+    assert merged.transpose_keys == {"k": (1, 0)}
 
 
-def test_create_engine_without_config_raises(runner):
-    vllm_config = MagicMock(spec=[])  # no weight_transfer_config attribute
-    with pytest.raises(ValueError, match="no weight_transfer_config"):
-        factory.create_engine(vllm_config=vllm_config, runner=runner)
-
-
-def test_init_weight_transfer_is_noop_when_unconfigured(runner):
-    worker = _FakeWorker(engine=None, runner=runner)
-    worker.vllm_config = MagicMock(spec=[])
-    worker.init_weight_transfer()
-    assert worker.weight_transfer_engine is None
-
-
-# --- colocated backend ------------------------------------------------------
-
-
-def test_jax_local_engine_forwards_to_sync_weights(runner):
-    engine = JaxLocalWeightTransferEngine(config=None,
-                                          vllm_config=None,
-                                          runner=runner)
-    engine.init_transfer_engine(
-        engine.parse_init_info({
-            "mappings": {
-                "a": ("b", ("model", ))
-            },
-            "transpose_keys": {
-                "kernel": (1, 0)
-            },
-        }))
-    engine.receive_weights(JaxLocalUpdateInfo(weights="STATE"))
-
-    assert len(runner.sync_calls) == 1
-    call = runner.sync_calls[0]
-    assert call["updated_weights"] == "STATE"
-    assert call["mappings"] == {"a": ("b", ("model", ))}
-    assert call["transpose_keys"] == {"kernel": (1, 0)}
-    assert call["reshard_fn"] is None
-
-
-def test_jax_local_per_update_overrides_win(runner):
-    engine = JaxLocalWeightTransferEngine(config=None,
-                                          vllm_config=None,
-                                          runner=runner)
-    engine.init_transfer_engine(
-        engine.parse_init_info({"mappings": {
-            "a": ("b", ())
-        }}))
-    engine.receive_weights(
-        JaxLocalUpdateInfo(weights="STATE", mappings={"c": ("d", ())}))
-    assert runner.sync_calls[0]["mappings"] == {"c": ("d", ())}
-
-
-def test_update_weights_blocks_until_ready(runner):
-    """The base update_weights must await the write, like torch's sync."""
-    engine = JaxLocalWeightTransferEngine(config=None,
-                                          vllm_config=None,
-                                          runner=runner)
-    engine.update_weights({"weights": "STATE"})
-    assert len(runner.sync_calls) == 1
+def test_from_dict_accepts_empty():
+    assert WeightUpdateRequest.from_dict(None) == WeightUpdateRequest()
+    assert WeightUpdateRequest.from_dict({}) == WeightUpdateRequest()
 
 
 # --- metadata ---------------------------------------------------------------
 
 
 def test_param_meta_from_sharded_array():
-    devices = jax.devices()
-    mesh = jax.sharding.Mesh(devices[:1], ("model", ))
+    mesh = jax.sharding.Mesh(jax.devices()[:1], ("model", ))
     sharding = jax.sharding.NamedSharding(mesh,
                                           jax.sharding.PartitionSpec("model"))
     array = jax.device_put(jnp.zeros((4, 8), dtype=jnp.bfloat16), sharding)
@@ -318,8 +253,6 @@ def test_param_meta_from_sharded_array():
 
 def test_param_meta_is_plain_data():
     """Metadata must survive an RPC hop to an out-of-process orchestrator."""
-    import pickle
-
     meta = ParamMeta.from_array(jnp.zeros((2, 3), dtype=jnp.float32))
     assert pickle.loads(pickle.dumps(meta)) == meta
 

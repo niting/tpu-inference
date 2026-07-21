@@ -46,42 +46,43 @@ four phases — `init_weight_transfer_engine`, `start_weight_update`,
 
 ### What Phase 1 added
 
-`tpu_inference/distributed/weight_transfer/`:
+Four methods on `TPUWorker` — `init_weight_transfer_engine`,
+`start_weight_update`, `update_weights`, `finish_weight_update` — plus
+`TPUModelRunner.get_weight_metadata()` and one data module,
+`tpu_inference/distributed/weight_transfer.py`, holding `ParamMeta` and
+`WeightUpdateRequest`.
 
-| File | Contents |
-|---|---|
-| `base.py` | `JaxWeightTransferEngine` (the JAX-native engine contract), `ParamMeta`, init/update payload bases |
-| `factory.py` | Backend registry: `register_engine`, `get_engine_cls`, `create_engine` |
-| `worker_mixin.py` | `WeightTransferWorkerMixin` — the worker-side session state machine |
-| `jax_local_engine.py` | `jax_local`: colocated reference backend |
+That is the whole surface. There is no engine class, no backend registry and
+no per-transport subclass: transport is a property of the request, not of an
+object graph.
 
-Plus `TPUModelRunner.get_weight_metadata()` and `TPUWorker` now mixing in
-`WeightTransferWorkerMixin`.
+### Three design decisions worth knowing
 
-### Two design decisions worth knowing
+**Method names are the integration point.** vLLM puts these four on
+`vllm.v1.worker.gpu_worker.Worker`, not `WorkerBase`, and `TPUWorker`
+subclasses `WorkerBase` — so it inherits none of them. But `collective_rpc`
+dispatches **by method name**, so defining them on `TPUWorker` is sufficient
+for `LLM`, `AsyncLLM`, `EngineCore`, all three TPU executors and the
+weight-update HTTP routes to drive a TPU sampler unmodified. Pause/resume for
+async RL needs nothing from us either — it is implemented purely at the
+scheduler level upstream.
 
-**We do not subclass vLLM's `WeightTransferEngine`.** Its base is torch-bound
-in ways that buy nothing on TPU: the constructor takes `torch.device` and
+**We do not use vLLM's `WeightTransferEngine` abstraction.** It is torch-bound
+in ways that buy nothing here: the constructor takes `torch.device` and
 `torch.nn.Module`, the concrete `update_weights` calls
 `torch.accelerator.synchronize()`, `WeightSource.__iter__` yields
 `torch.Tensor`, and the receive path assumes
 `model.load_weights([(name, tensor)])`. None of the shipped engines are
 reusable either — NCCL, IPC and sparse-NCCL all call
-`torch.cuda.current_stream()`. So `base.py` defines a parallel contract whose
-`update_weights` ends in `jax.block_until_ready(runner.state_leaves)`, the
-JAX analogue of the torch sync.
+`torch.cuda.current_stream()`. The JAX analogue of that sync is
+`jax.block_until_ready(runner.state_leaves)`, which `update_weights` does
+directly.
 
-**We do keep vLLM's worker method names.** vLLM puts the four methods on
-`vllm.v1.worker.gpu_worker.Worker`, not `WorkerBase`, and `TPUWorker`
-subclasses `WorkerBase` — so it inherits none of them. But `collective_rpc`
-dispatches **by method name**, so duck-typed methods are enough. The
-consequence is that everything above the worker works unmodified: `LLM`,
-`AsyncLLM`, `EngineCore`, all three TPU executors, and the weight-update HTTP
-routes. `WeightTransferConfig.backend` is typed `Literal[...] | str` upstream,
-so `backend="jax_local"` validates without patching vLLM.
-
-Pause/resume for async RL also needs nothing from us: it is implemented purely
-at the scheduler level upstream.
+**Transport is selected by the payload.** `WeightUpdateRequest` carries
+exactly one source: `weights` (a live pytree from a colocated trainer) or
+`source_endpoints` (Raiden peers to pull from). Setting both is an error;
+setting neither is an error. Adding the Raiden transport in Phase 2 means
+filling in one branch of `update_weights`, not registering a backend.
 
 ### Who owns the KV cache
 
@@ -97,25 +98,30 @@ The prefix cache lives on the scheduler, so callers must still call
 ### Usage
 
 ```python
-llm = LLM(model=..., weight_transfer_config=WeightTransferConfig(backend="jax_local"))
-
+# Optional: session defaults, so every chunk need not repeat them.
 llm.init_weight_transfer_engine(dict(mappings=..., transpose_keys=...))
 
 # per RL step
 llm.reset_prefix_cache()
-llm.start_weight_update()
+llm.start_weight_update()                     # frees the KV cache
 llm.update_weights(dict(weights=new_state))   # repeatable for chunked transfer
-llm.finish_weight_update()
+llm.finish_weight_update()                    # reallocates the KV cache
 ```
+
+No engine configuration is required: `LLM.init_weight_transfer_engine` and
+friends are pure `collective_rpc` calls upstream, with no guard on
+`weight_transfer_config`. Once Raiden lands, the same loop with
+`dict(source_endpoints=[...])` in place of `weights` drives the networked path.
 
 ### Limitations
 
 - **flax_nnx path only.** `get_weight_metadata()` raises `NotImplementedError`
   on the torchax path, which stores weights as a flat `dict[str, jax.Array]`
   keyed by dotted torch parameter names and needs its own key convention.
-- **`jax_local` is in-process only.** Its payload carries live `jax.Array`
-  objects and an optional callable, so it requires an in-process or uniproc
-  executor.
+- **Colocated transport only.** `weights` carries live `jax.Array` objects and
+  an optional callable, so it requires an in-process or uniproc executor.
+  `source_endpoints` is accepted and validated but raises
+  `NotImplementedError` — that is Phase 2.
 - **No chunk accounting.** Nothing verifies that the chunks received in a
   session cover every parameter. See Phase 3.
 - **No draft-model support.** `start_draft_weight_update` is not implemented;
@@ -270,31 +276,24 @@ Endpoint publication should reuse the KV connector's existing pattern:
 
 ### 4.5 Proposed shape
 
-```python
-@dataclass
-class RaidenInitInfo(WeightTransferInitInfo):
-    trainer_endpoints: list[dict]   # [{"endpoint": "ip:port", "shards": [...]}]
-    parallelism: int = 1
-    mode: str = "pull"              # "pull" | "push"
+No new abstraction. `WeightUpdateRequest.source_endpoints` already selects the
+Raiden transport; Phase 2 fills in the branch that currently raises
+`NotImplementedError`:
 
-@dataclass
-class RaidenUpdateInfo(WeightTransferUpdateInfo):
-    param_names: list[str]          # which params this chunk covers
-    bucket_id: int                  # which synchronizer group
+- `init_weight_transfer_engine` with `source_endpoints` set: bucket
+  `runner.state` (4.1), construct one `WeightSynchronizer` per bucket, publish
+  this worker's own per-shard endpoints for the orchestrator to hand back to
+  the trainer.
+- `start_weight_update`: unchanged — the worker already frees the KV cache.
+- `update_weights` with `source_endpoints` set: `pull_weights()` per bucket
+  (or wait for a push), then resolve the buffer-lifetime question in 4.2.
+- `finish_weight_update`: unchanged, plus verification once chunk accounting
+  exists (5.2).
 
-class RaidenWeightTransferEngine(JaxWeightTransferEngine):
-    init_info_cls, update_info_cls = RaidenInitInfo, RaidenUpdateInfo
-```
-
-- `init_transfer_engine`: bucket `runner.state` (4.1), construct one
-  `WeightSynchronizer` per bucket, publish endpoints.
-- `start_weight_update`: no-op (the worker already freed the KV cache).
-- `receive_weights`: `pull_weights()` per bucket, or wait for a push.
-- `finish_weight_update`: rebind or verify `runner.state_leaves` (4.2).
-- `shutdown`: drop synchronizers, close ports.
-
-Everything is plain data over `collective_rpc`, so this backend works
-cross-process — unlike `jax_local`.
+If Raiden needs more per-chunk parameters than `source_endpoints` (a bucket
+index, a parameter-name list), they become optional fields on the same
+dataclass. All of it is plain data over `collective_rpc`, so unlike the
+colocated path this works cross-process.
 
 ### 4.6 Phase 2 checklist
 
@@ -302,7 +301,7 @@ cross-process — unlike `jax_local`.
 - [ ] `TPU_WEIGHT_TRANSFER_PORT` + per-shard endpoint publication
 - [ ] Bucketing of `runner.state` into synchronizer groups
 - [ ] Resolve buffer lifetime (4.2); regression test for a **second** sync
-- [ ] `RaidenWeightTransferEngine` + registration as `"raiden"`
+- [ ] Fill in the `source_endpoints` branch of `update_weights`
 - [ ] Multi-host test: 2 hosts, equal meshes, bit-exact weight parity
 - [ ] Guard against the bare-`host:port` broadcast hazard
 

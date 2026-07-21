@@ -214,28 +214,35 @@ dominating.
 This is the subtlest correctness risk in the design.
 
 `WeightSynchronizer` takes a PJRT `BufferHoldAndAlias` on each array **at
-construction**. Meanwhile tpu-inference:
+construction**, so it writes into whatever arrays existed at that moment.
 
-- builds the jitted model with `donate_argnums=(0,)` in `create_jit_model`,
-  so weight buffers are donation candidates; and
-- **rebinds** `runner.state` and `runner.state_leaves` on every
-  `_sync_weights` call, so the arrays a synchronizer holds are not the arrays
-  the model will next execute against.
+The steady-state forward pass is *not* a problem: `run_model` and
+`run_draft_model` use `donate_argnums=1`, which is the KV cache — argument 0
+is `state_leaves` and is **not** donated. (`create_jit_model` does use
+`donate_argnums=(0,)`, but that runs once on the load path, before any
+synchronizer exists.)
 
-Any of three resolutions, in order of preference:
+The problem is `_sync_weights`. It rebuilds the state:
+`transfer_state_with_mappings` calls `set_value(...)` on each target param and
+returns a new state, so `runner.state` / `runner.state_leaves` come to point at
+*new* `jax.Array`s. A synchronizer constructed earlier still holds the old
+buffers, and would write into arrays the model no longer executes against —
+silently.
 
-1. **Write in place.** Make the receive path H2D directly into the held
-   buffers and *not* rebind `runner.state`. This is the only option that makes
-   a long-lived synchronizer correct, and it is what `h2d_chunk` is for. It
-   requires `_sync_weights`' "build a new state, then swap" structure to
-   change for this backend.
+Resolution, in order of preference:
+
+1. **Write in place, and don't call `_sync_weights` at all on this path.**
+   Raiden's `h2d`/`h2d_chunk` DMA directly into the held buffers, so the arrays
+   never need replacing and `runner.state` stays untouched. This is both the
+   correct answer and the fast one. It does mean the *trainer* must supply data
+   already named and laid out for the sampler — which is exactly what
+   `get_weight_metadata()` is for. Name mapping and transposition move to the
+   trainer; the sampler just receives bytes.
 2. **Reconstruct per sync.** Build a fresh `WeightSynchronizer` each update.
-   Correct and simple; pays setup + `BufferHoldAndAlias` cost every step, and
-   re-opens ports every step.
-3. **Pin the weight buffers.** Disable donation for the weight argument. Costs
-   peak HBM during forward.
+   Correct and simple; pays setup + `BufferHoldAndAlias` + port binding every
+   step.
 
-Validate whichever is chosen with a test that syncs twice and asserts the
+Validate whichever is chosen with a test that syncs **twice** and asserts the
 second sync actually lands — a stale hold fails silently, not loudly.
 
 ### 4.3 Sharding: pick the cheap answer first

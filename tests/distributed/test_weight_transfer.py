@@ -12,8 +12,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from tpu_inference.distributed.weight_transfer import (COLOCATED, RAIDEN,
-                                                       ParamMeta,
+from tpu_inference.distributed.weight_transfer import (ParamMeta,
                                                        WeightUpdateRequest)
 from tpu_inference.worker.tpu_worker import TPUWorker
 
@@ -101,31 +100,6 @@ def test_multiple_sequential_sessions(worker, runner):
     assert runner.kv_events == ["delete", "reinit"] * 3
 
 
-def test_init_supplies_session_defaults(worker, runner):
-    worker.init_weight_transfer_engine({
-        "mappings": {
-            "a": ("b", ("model", ))
-        },
-        "transpose_keys": {
-            "kernel": (1, 0)
-        },
-    })
-    worker.start_weight_update()
-    worker.update_weights({"weights": "STATE"})
-
-    call = runner.sync_calls[0]
-    assert call["mappings"] == {"a": ("b", ("model", ))}
-    assert call["transpose_keys"] == {"kernel": (1, 0)}
-    assert call["reshard_fn"] is None
-
-
-def test_per_chunk_fields_override_defaults(worker, runner):
-    worker.init_weight_transfer_engine({"mappings": {"a": ("b", ())}})
-    worker.start_weight_update()
-    worker.update_weights({"weights": "STATE", "mappings": {"c": ("d", ())}})
-    assert runner.sync_calls[0]["mappings"] == {"c": ("d", ())}
-
-
 def test_reshard_fn_is_forwarded(worker, runner):
     fn = lambda src, tgt: src
     worker.start_weight_update()
@@ -133,8 +107,7 @@ def test_reshard_fn_is_forwarded(worker, runner):
     assert runner.sync_calls[0]["reshard_fn"] is fn
 
 
-def test_init_is_optional(worker, runner):
-    """The colocated path works without ever calling init."""
+def test_mappings_default_to_empty(worker, runner):
     worker.start_weight_update()
     worker.update_weights({"weights": "STATE"})
     assert runner.sync_calls[0]["mappings"] == {}
@@ -152,12 +125,6 @@ def test_double_start_raises(worker):
     worker.start_weight_update()
     with pytest.raises(RuntimeError, match="already"):
         worker.start_weight_update()
-
-
-def test_update_without_a_source_raises(worker):
-    worker.start_weight_update()
-    with pytest.raises(ValueError, match="no source"):
-        worker.update_weights({"mappings": {}})
 
 
 def test_unknown_field_raises(worker):
@@ -186,48 +153,33 @@ def test_finish_is_idempotent_for_kv_cache(worker, runner):
     assert runner.kv_events.count("reinit") == 1
 
 
-# --- raiden path ------------------------------------------------------------
+# --- push transport ---------------------------------------------------------
 
 
-def test_raiden_transport_is_recognised_but_unimplemented(worker):
+def test_empty_update_is_a_noop(worker, runner):
+    """Raiden push: the trainer already wrote into HBM, nothing to apply."""
     worker.start_weight_update()
-    with pytest.raises(NotImplementedError, match="Raiden"):
-        worker.update_weights({"source_endpoints": ["10.0.0.1:9200"]})
+    worker.update_weights({})
+    worker.finish_weight_update()
+    assert runner.sync_calls == []
+    # The KV cache is still cycled -- that is the part the sampler owns.
+    assert runner.kv_events == ["delete", "reinit"]
 
 
-def test_raiden_init_is_recognised_but_unimplemented(worker):
-    with pytest.raises(NotImplementedError, match="Raiden"):
-        worker.init_weight_transfer_engine(
-            {"source_endpoints": ["10.0.0.1:9200"]})
+def test_empty_update_still_requires_a_session(worker):
+    with pytest.raises(RuntimeError, match="start_weight_update must be"):
+        worker.update_weights({})
 
 
-def test_both_sources_set_is_rejected(worker):
+def test_init_weight_transfer_engine_accepts_and_is_harmless(worker, runner):
+    worker.init_weight_transfer_engine({})
     worker.start_weight_update()
-    with pytest.raises(ValueError, match="not both"):
-        worker.update_weights({
-            "weights": "STATE",
-            "source_endpoints": ["10.0.0.1:9200"]
-        })
+    worker.update_weights({"weights": "STATE"})
+    worker.finish_weight_update()
+    assert len(runner.sync_calls) == 1
 
 
 # --- request type -----------------------------------------------------------
-
-
-def test_transport_detection():
-    assert WeightUpdateRequest(weights="S").transport == COLOCATED
-    assert WeightUpdateRequest(source_endpoints=["a:1"]).transport == RAIDEN
-    assert WeightUpdateRequest().transport is None
-
-
-def test_with_defaults_only_fills_unset_fields():
-    defaults = WeightUpdateRequest(mappings={"a": ("b", ())},
-                                   transpose_keys={"k": (1, 0)})
-    merged = WeightUpdateRequest(weights="S", mappings={
-        "c": ("d", ())
-    }).with_defaults(defaults)
-    assert merged.weights == "S"
-    assert merged.mappings == {"c": ("d", ())}
-    assert merged.transpose_keys == {"k": (1, 0)}
 
 
 def test_from_dict_accepts_empty():

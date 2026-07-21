@@ -27,8 +27,7 @@ from tpu_inference.distributed import jax_parallel_state
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
 from tpu_inference.distributed.utils import (get_device_topology_order_id,
                                              get_host_ip, get_kv_transfer_port)
-from tpu_inference.distributed.weight_transfer import (COLOCATED, RAIDEN,
-                                                       ParamMeta,
+from tpu_inference.distributed.weight_transfer import (ParamMeta,
                                                        WeightUpdateRequest)
 from tpu_inference.layers.common.sharding import ShardingConfigManager
 from tpu_inference.logger import init_logger
@@ -185,7 +184,6 @@ class TPUWorker(WorkerBase):
     # when no RL framework ever calls the weight-update API.
     _weight_update_active: bool = False
     _kv_cache_freed: bool = False
-    _weight_transfer_defaults: Optional[WeightUpdateRequest] = None
 
     def __init__(
         self,
@@ -758,17 +756,16 @@ class TPUWorker(WorkerBase):
         return self.model_runner.get_weight_metadata()
 
     def init_weight_transfer_engine(self, init_info: Dict[str, Any]) -> None:
-        """Set session defaults and open the transport.
+        """Prepare the transport. No setup is needed today.
 
-        Optional for the colocated path -- supplying `mappings` and
-        `transpose_keys` once here just saves repeating them on every chunk.
+        This is where the Raiden push path will build this worker's
+        `WeightSynchronizer` -- binding it to the live weight buffers and
+        publishing per-shard endpoints for the trainer to push into. It has to
+        happen in this process: the synchronizer needs raw PJRT buffer
+        pointers and this process's addressable shards. The colocated path
+        needs no setup at all.
         """
-        defaults = WeightUpdateRequest.from_dict(init_info)
-        if defaults.transport == RAIDEN:
-            raise NotImplementedError(
-                "Raiden weight transport is not implemented yet; see "
-                "docs/developer_guides/rl_weight_sync.md.")
-        self._weight_transfer_defaults = defaults
+        logger.info("init_weight_transfer_engine: %s", sorted(init_info or {}))
 
     def start_weight_update(self, free_kv_cache: bool = True) -> None:
         """Open a weight update session.
@@ -793,7 +790,12 @@ class TPUWorker(WorkerBase):
         self._weight_update_active = True
 
     def update_weights(self, update_info: Dict[str, Any]) -> None:
-        """Receive one chunk of weights.
+        """Apply one chunk of weights handed over by a colocated trainer.
+
+        With an empty request this is a no-op, which is the Raiden push case:
+        the trainer wrote straight into this worker's HBM and Raiden's receiver
+        auto-H2D'd on receipt, so there is nothing to apply. The phase is kept
+        because vLLM's contract has it and the colocated path needs it.
 
         May be called repeatedly within a session for chunked transfers.
         """
@@ -801,26 +803,18 @@ class TPUWorker(WorkerBase):
             raise RuntimeError(
                 "start_weight_update must be called before update_weights.")
 
-        request = WeightUpdateRequest.from_dict(update_info).with_defaults(
-            self._weight_transfer_defaults)
+        request = WeightUpdateRequest.from_dict(update_info)
+        if request.weights is None:
+            return
+
         try:
-            transport = request.transport
-            if transport == COLOCATED:
-                self.model_runner._sync_weights(
-                    updated_weights=request.weights,
-                    mappings=request.mappings or {},
-                    transpose_keys=request.transpose_keys or {},
-                    reshard_fn=request.reshard_fn)
-            elif transport == RAIDEN:
-                raise NotImplementedError(
-                    "Raiden weight transport is not implemented yet; see "
-                    "docs/developer_guides/rl_weight_sync.md.")
-            else:
-                raise ValueError(
-                    "Weight update specified no source: set 'weights' for a "
-                    "colocated trainer or 'source_endpoints' for Raiden.")
-            # Transfers may be asynchronous; the next forward pass must not
-            # race the write.
+            self.model_runner._sync_weights(
+                updated_weights=request.weights,
+                mappings=request.mappings or {},
+                transpose_keys=request.transpose_keys or {},
+                reshard_fn=request.reshard_fn)
+            # The write may be asynchronous; the next forward pass must not
+            # race it.
             jax.block_until_ready(self.model_runner.state_leaves)
         except BaseException:
             # Some chunks may have landed, so the model is in an unknown

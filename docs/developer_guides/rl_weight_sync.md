@@ -25,7 +25,12 @@ is the case Phases 2 and 3 address.
 vLLM standardized the sampler-side API for both in its
 [native weight transfer subsystem](https://docs.vllm.ai/en/latest/training/weight_transfer/):
 four phases — `init_weight_transfer_engine`, `start_weight_update`,
-`update_weights`, `finish_weight_update` — over a pluggable transport.
+`update_weights`, `finish_weight_update` — over a pluggable transport. We keep
+those names for consistency with the GPU path.
+
+**Decision: the disaggregated path is push.** The trainer drives the transfer
+and the sampler is a passive receiver. Everything below assumes it; where it
+changes a design, that is called out.
 
 ---
 
@@ -78,11 +83,11 @@ reusable either — NCCL, IPC and sparse-NCCL all call
 `jax.block_until_ready(runner.state_leaves)`, which `update_weights` does
 directly.
 
-**Transport is selected by the payload.** `WeightUpdateRequest` carries
-exactly one source: `weights` (a live pytree from a colocated trainer) or
-`source_endpoints` (Raiden peers to pull from). Setting both is an error;
-setting neither is an error. Adding the Raiden transport in Phase 2 means
-filling in one branch of `update_weights`, not registering a backend.
+**Transport is selected by the payload.** `WeightUpdateRequest.weights`
+carries a live pytree from a colocated trainer. An *empty* request is the
+Raiden push case: the trainer wrote straight into this worker's HBM, so
+`update_weights` has nothing to apply. No backend registry, no transport enum
+-- presence of `weights` is the whole signal.
 
 ### Who owns the KV cache
 
@@ -97,21 +102,32 @@ The prefix cache lives on the scheduler, so callers must still call
 
 ### Usage
 
-```python
-# Optional: session defaults, so every chunk need not repeat them.
-llm.init_weight_transfer_engine(dict(mappings=..., transpose_keys=...))
+Colocated trainer, today:
 
-# per RL step
+```python
 llm.reset_prefix_cache()
 llm.start_weight_update()                     # frees the KV cache
 llm.update_weights(dict(weights=new_state))   # repeatable for chunked transfer
 llm.finish_weight_update()                    # reallocates the KV cache
 ```
 
+Raiden push, once Phase 2 lands — same phases, and the trainer's push happens
+between `start` and `finish`:
+
+```python
+llm.init_weight_transfer_engine({})            # binds WeightSynchronizers
+sampler_eps = llm.collective_rpc("get_weight_transfer_endpoints")
+
+llm.reset_prefix_cache()
+llm.start_weight_update()                      # frees KV; workers now receivers
+trainer.start_transfer(sampler_eps)            # pushes; only the trainer can
+trainer.await_transfer()                       # observe completion
+llm.finish_weight_update()                     # reallocates the KV cache
+```
+
 No engine configuration is required: `LLM.init_weight_transfer_engine` and
 friends are pure `collective_rpc` calls upstream, with no guard on
-`weight_transfer_config`. Once Raiden lands, the same loop with
-`dict(source_endpoints=[...])` in place of `weights` drives the networked path.
+`weight_transfer_config`.
 
 ### Limitations
 
@@ -119,9 +135,12 @@ friends are pure `collective_rpc` calls upstream, with no guard on
   on the torchax path, which stores weights as a flat `dict[str, jax.Array]`
   keyed by dotted torch parameter names and needs its own key convention.
 - **Colocated transport only.** `weights` carries live `jax.Array` objects and
-  an optional callable, so it requires an in-process or uniproc executor.
-  `source_endpoints` is accepted and validated but raises
-  `NotImplementedError` — that is Phase 2.
+  an optional callable, so it requires an in-process or uniproc executor. The
+  push path's phases already behave correctly (the KV cache is cycled, the
+  session is guarded); what is missing is the `WeightSynchronizer` — Phase 2.
+- **No endpoint publication.** `get_weight_transfer_endpoints()` does not
+  exist yet. For push it is the single most important missing piece: the
+  trainer cannot push without it.
 - **No chunk accounting.** Nothing verifies that the chunks received in a
   session cover every parameter. See Phase 3.
 - **No draft-model support.** `start_draft_weight_update` is not implemented;
@@ -249,7 +268,7 @@ second sync actually lands — a stale hold fails silently, not loudly.
 
 Trainer mesh ≠ sampler mesh in general. Three strategies:
 
-1. **Constrain the meshes equal.** Plain push/pull works with shipping Raiden.
+1. **Constrain the meshes equal.** Plain push works with shipping Raiden.
    Start here.
 2. **Reshard on the trainer before transfer.** The orchestration proposal's
    `convert(weights, dst_sharding_pytree)`. Correct and simple; costs a full
@@ -283,24 +302,37 @@ Endpoint publication should reuse the KV connector's existing pattern:
 
 ### 4.5 Proposed shape
 
-No new abstraction. `WeightUpdateRequest.source_endpoints` already selects the
-Raiden transport; Phase 2 fills in the branch that currently raises
-`NotImplementedError`:
+**We are going with push**: the trainer drives the transfer and the sampler is
+a passive receiver. That decision removes work rather than adding it, because
+Raiden's receiver auto-H2Ds in C++ on data receipt (`OnDataReceived()` →
+`H2d()` + `Await()`). No new abstraction is needed; the phases stay as they
+are:
 
-- `init_weight_transfer_engine` with `source_endpoints` set: bucket
-  `runner.state` (4.1), construct one `WeightSynchronizer` per bucket, publish
-  this worker's own per-shard endpoints for the orchestrator to hand back to
-  the trainer.
-- `start_weight_update`: unchanged — the worker already frees the KV cache.
-- `update_weights` with `source_endpoints` set: `pull_weights()` per bucket
-  (or wait for a push), then resolve the buffer-lifetime question in 4.2.
-- `finish_weight_update`: unchanged, plus verification once chunk accounting
-  exists (5.2).
+- `init_weight_transfer_engine`: bucket `runner.state` (4.1), construct one
+  `WeightSynchronizer` per bucket bound to the live weight buffers, and record
+  this worker's per-shard endpoints. Must happen in the worker process —
+  `UnpackJaxArrays` needs raw `xla::PjRtBuffer*` and this process's
+  `addressable_shards`.
+- **New:** `get_weight_transfer_endpoints()` returns that per-shard list for
+  the orchestrator to hand to the trainer. This is the piece push cannot work
+  without.
+- `start_weight_update`: unchanged. Frees the KV cache; workers are now
+  passive receivers.
+- `update_weights`: **stays a no-op for push.** Nothing is handed over. Kept
+  for the colocated path and for vLLM contract parity.
+- `finish_weight_update`: unchanged today. Gains verification once chunk
+  accounting exists (5.2).
 
-If Raiden needs more per-chunk parameters than `source_endpoints` (a bucket
-index, a parameter-name list), they become optional fields on the same
-dataclass. All of it is plain data over `collective_rpc`, so unlike the
-colocated path this works cross-process.
+Note what push does *not* need: no `pull_weights` call, no per-chunk payload,
+no transport field. The sampler never learns the trainer's address — only the
+reverse.
+
+**Completion is not observable on the sampler.** The JAX `WeightSynchronizer`
+exposes no receiver-side `poll`/`wait`/byte-count; `OnDataReceived` is
+C++-internal. So the orchestrator must gate `finish_weight_update` on the
+*trainer's* transfer status, which is exactly what the RL orchestration
+proposal does with `get_transfer_status(req_id)`. This is structurally forced,
+not a preference.
 
 ### 4.6 Phase 2 checklist
 
@@ -308,7 +340,7 @@ colocated path this works cross-process.
 - [ ] `TPU_WEIGHT_TRANSFER_PORT` + per-shard endpoint publication
 - [ ] Bucketing of `runner.state` into synchronizer groups
 - [ ] Resolve buffer lifetime (4.2); regression test for a **second** sync
-- [ ] Fill in the `source_endpoints` branch of `update_weights`
+- [ ] `get_weight_transfer_endpoints()` on worker and runner
 - [ ] Multi-host test: 2 hosts, equal meshes, bit-exact weight parity
 - [ ] Guard against the bare-`host:port` broadcast hazard
 
@@ -340,7 +372,7 @@ on both sides and drive `pull_weights_chunk` + `h2d_chunk` per chunk.
   weights and no way to detect it. Phase 3 should add a session manifest: the
   set of parameters a session promised, checked at `finish_weight_update`, so
   an incomplete update fails loudly instead of serving a chimera.
-- Decide recovery policy: refuse to resume, or re-pull the whole set.
+- Decide recovery policy: refuse to resume, or re-push the whole set.
 
 ### 5.3 Scale and coverage
 

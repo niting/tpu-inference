@@ -150,7 +150,7 @@ class QuantLinearConfig(CommonQuantLinearConfig):
                                  if c in contracting_axes)
 
         # Extract and fuse sharding per axis category.
-        sharding = _to_partition_spec(getattr(weight, "sharding", ()))
+        sharding = _to_partition_spec(getattr(weight, "out_sharding", ()))
         sharding = sharding + (None, ) * (len(weight.shape) - len(sharding))
 
         in_sharding = set(s for i, s in enumerate(sharding)

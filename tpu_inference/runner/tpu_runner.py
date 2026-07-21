@@ -25,7 +25,6 @@ import jax.numpy as jnp
 import jaxtyping
 import numpy as np
 import torch
-import vllm.envs as vllm_envs
 import vllm.lora.utils as lora_utils_mod
 from flax import nnx
 from jax._src.pallas.utils import next_power_of_2
@@ -857,6 +856,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         """Generative model or pooling model select different computations."""
         self.enable_continue_decode = self.vllm_config.additional_config.get(
             "enable_continue_decode", False)
+        self.continue_decode_eos_check_interval = self.vllm_config.additional_config.get(
+            "continue_decode_eos_check_interval", 1)
         self.static_max_decode_steps = self.vllm_config.additional_config.get(
             "max_decode_steps", DEFAULT_MAX_DECODE_STEPS)
         self.eos_token_id = runner_utils.get_eos_token_id(self.model_config)
@@ -1043,7 +1044,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                next_power_of_2(self.dp_size * kv_packing)),
             max_token_size=scheduler_config.max_num_batched_tokens *
             self.dp_size,
-            padding_gap=vllm_envs.VLLM_TPU_BUCKET_PADDING_GAP)
+            padding_gap=envs.VLLM_TPU_BUCKET_PADDING_GAP)
         self.num_tokens_paddings = sorted(self.num_tokens_paddings +
                                           additional_sizes)
         self.num_tokens_paddings_per_dp = [
@@ -1814,6 +1815,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                      "enable_return_routed_experts", False),
                  max_logprobs=self.model_config.max_logprobs,
                  logprobs_mode=self.model_config.logprobs_mode,
+                 continue_decode_eos_check_interval=self.
+                 continue_decode_eos_check_interval,
              )
 
         if self.scheduler_config.async_scheduling:

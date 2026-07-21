@@ -1633,7 +1633,8 @@ class CompilationManager:
         draft_kv_cache_group_id = num_kv_cache_groups - 1
         block_tables = self.runner.input_batch.block_table[
             draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
-        dp_spec = PartitionSpec(ShardingAxisName.ATTN_DATA, )
+        dp_spec = PartitionSpec() if dp_size == 1 else PartitionSpec(
+            ShardingAxisName.ATTN_DATA)
         dp_spec_2d = PartitionSpec(ShardingAxisName.ATTN_DATA, None)
 
         dp_sharding = NamedSharding(self.runner.mesh, dp_spec)
@@ -1678,65 +1679,66 @@ class CompilationManager:
         block_size = self.runner.drafter.block_size
 
         # -------------------------------------------------------------
-        # Part 1: Compile drafter_propose (loops over target num_tokens)
+        # Part 1: Compile drafter_propose (loops over batch sizes)
         # -------------------------------------------------------------
-        # input_ids always has constant shape (max_num_reqs * block_size)
-        num_tokens_propose = self.runner.max_num_reqs * block_size
-        input_ids_propose = self._create_dummy_tensor((num_tokens_propose, ),
-                                                      jnp.int32, dp_sharding)
-
         for num_tokens in self.runner.num_tokens_paddings:
-            positions_propose = self._create_dummy_tensor(
-                (num_tokens_propose, ), jnp.int32, dp_sharding)
-            attention_metadata_propose = AttentionMetadata(
-                input_positions=positions_propose,
-                block_tables=block_tables,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                request_distribution=request_distribution,
-                mamba_state_indices=dflash_mamba_state_indices,
-                padded_num_reqs=self.runner.max_num_reqs,
-            )
+            for num_reqs in self.runner.attn_num_reqs_paddings:
+                num_tokens_propose = self.runner.max_num_reqs * block_size
+                input_ids_propose = self._create_dummy_tensor(
+                    (num_tokens_propose, ), jnp.int32, dp_sharding)
+                positions_propose = self._create_dummy_tensor(
+                    (num_tokens_propose, ), jnp.int32, dp_sharding)
+                attention_metadata_propose = AttentionMetadata(
+                    input_positions=positions_propose,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                    request_distribution=request_distribution,
+                    mamba_state_indices=dflash_mamba_state_indices,
+                    padded_num_reqs=num_reqs,
+                )
 
-            def drafter_propose_warmup(_fn,
-                                       _args,
-                                       _call_kwargs,
-                                       num_tokens=num_tokens):
-                new_args = (self.runner.kv_caches, ) + _args[1:]
-                logger.info("Warmup drafter_propose: num_tokens=%d",
-                            num_tokens)
-                kv_caches, draft_token_ids = self.runner.drafter.propose(
-                    *new_args, **_call_kwargs)
-                self.runner.kv_caches = kv_caches
-                return draft_token_ids
+                def drafter_propose_warmup(_fn,
+                                           _args,
+                                           _call_kwargs,
+                                           num_reqs=num_reqs):
+                    new_args = (self.runner.kv_caches, ) + _args[1:]
+                    logger.info("Warmup drafter_propose: num_reqs=%d",
+                                num_reqs)
+                    kv_caches, draft_token_ids = self.runner.drafter.propose(
+                        *new_args, **_call_kwargs)
+                    self.runner.kv_caches = kv_caches
+                    return draft_token_ids
 
-            draft_hidden_size = hf_config.hidden_size
-            target_hidden_propose = self._create_dummy_tensor(
-                (num_tokens, draft_hidden_size), dtype,
-                NamedSharding(self.runner.mesh,
-                              PartitionSpec(None,
-                                            ShardingAxisName.MLP_TENSOR)))
-            new_query_start_loc = self._create_dummy_tensor(
-                (self.runner.max_num_reqs + dp_size, ), jnp.int32,
-                NamedSharding(self.runner.mesh, PartitionSpec()))
-            new_input_positions = self._create_dummy_tensor(
-                (num_tokens, ), jnp.int32,
-                NamedSharding(self.runner.mesh, PartitionSpec()))
-            target_hidden_states_propose = (target_hidden_propose,
-                                            new_query_start_loc,
-                                            new_input_positions)
+                draft_hidden_size = hf_config.hidden_size
+                target_hidden_propose = self._create_dummy_tensor(
+                    (num_tokens, draft_hidden_size), dtype,
+                    NamedSharding(
+                        self.runner.mesh,
+                        PartitionSpec(
+                            None
+                            if dp_size == 1 else ShardingAxisName.MLP_DATA,
+                            ShardingAxisName.MLP_TENSOR)))
+                new_query_start_loc = self._create_dummy_tensor(
+                    (self.runner.max_num_reqs + dp_size, ), jnp.int32,
+                    dp_sharding)
+                new_input_positions = self._create_dummy_tensor(
+                    (num_tokens, ), jnp.int32, dp_sharding)
+                target_hidden_states_propose = (target_hidden_propose,
+                                                new_query_start_loc,
+                                                new_input_positions)
 
-            self._run_compilation(
-                "drafter_propose",
-                self.runner.drafter.propose,
-                self.runner.kv_caches,
-                input_ids_propose,
-                attention_metadata_propose,
-                last_token_indices,
-                target_hidden_states_propose,
-                num_tokens=num_tokens,
-                warmup_handler=drafter_propose_warmup,
-            )
+                self._run_compilation(
+                    f"drafter_propose (num_tokens={num_tokens})",
+                    self.runner.drafter.propose,
+                    self.runner.kv_caches,
+                    input_ids_propose,
+                    attention_metadata_propose,
+                    last_token_indices,
+                    target_hidden_states_propose,
+                    num_reqs=num_reqs,
+                    warmup_handler=drafter_propose_warmup,
+                )
 
         # -------------------------------------------------------------
         # Part 2: Compile drafter_prepare_inputs (loops over target shapes)
@@ -1948,6 +1950,7 @@ class CompilationManager:
                 is_last_rank,
                 dp_size,
                 collect_expert_indices,
+                continue_decode_eos_check_interval,
             ):
                 (generated_tokens, final_kv_caches, final_state, final_rng,
                  all_expert_indices, logprobs_tensors) = continue_decode(
@@ -1972,6 +1975,8 @@ class CompilationManager:
                      collect_expert_indices=collect_expert_indices,
                      max_logprobs=self.runner.model_config.max_logprobs,
                      logprobs_mode=self.runner.model_config.logprobs_mode,
+                     continue_decode_eos_check_interval=
+                     continue_decode_eos_check_interval,
                  )
                 self.runner.kv_caches = final_kv_caches
                 return generated_tokens
@@ -2005,5 +2010,6 @@ class CompilationManager:
                 self.runner.dp_size,
                 getattr(self.runner.vllm_config.model_config,
                         "enable_return_routed_experts", False),
+                self.runner.continue_decode_eos_check_interval,
                 warmup_handler=continue_decode_warmup,
             )

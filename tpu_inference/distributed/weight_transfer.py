@@ -12,8 +12,8 @@ Two transports, distinguished by whether `weights` is set:
   trainer shares a process and a JAX client with the sampler, which is how RL
   frameworks drive tpu-inference today.
 - Unset: the trainer is a separate process and pushed straight into this
-  worker's HBM over Raiden, so there is nothing to apply here. See
-  docs/developer_guides/rl_weight_sync.md.
+  worker's HBM over Raiden, so there is nothing to apply here. Raiden's
+  receiver auto-H2Ds on data receipt, which is why the sampler is passive.
 """
 
 from dataclasses import dataclass, fields

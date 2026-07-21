@@ -27,6 +27,8 @@ from tpu_inference.distributed import jax_parallel_state
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
 from tpu_inference.distributed.utils import (get_device_topology_order_id,
                                              get_host_ip, get_kv_transfer_port)
+from tpu_inference.distributed.weight_transfer import \
+    WeightTransferWorkerMixin
 from tpu_inference.layers.common.sharding import ShardingConfigManager
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.jax_intermediate_tensor import \
@@ -176,7 +178,7 @@ def _parse_profile_options(
     return standard_opts, advanced_opts
 
 
-class TPUWorker(WorkerBase):
+class TPUWorker(WeightTransferWorkerMixin, WorkerBase):
 
     def __init__(
         self,
@@ -658,6 +660,9 @@ class TPUWorker(WorkerBase):
 
     def load_model(self) -> None:
         self.model_runner.load_model()
+        # Built after the weights exist, so a backend can bind to the live
+        # arrays. No-op unless weight_transfer_config is set.
+        self.init_weight_transfer()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         self.model_runner.capture_model()
@@ -727,7 +732,13 @@ class TPUWorker(WorkerBase):
         reshard_fn: Callable[[jaxtyping.PyTree, jaxtyping.PyTree],
                              jaxtyping.PyTree] = None
     ) -> None:
-        """Sync the updated weights to the model runner."""
+        """Sync the updated weights to the model runner.
+
+        Predates vLLM's native weight-update API. Prefer
+        `start_weight_update` / `update_weights` / `finish_weight_update`
+        (see `tpu_inference/distributed/weight_transfer/`), which handle the
+        KV-cache lifecycle for you and work with non-colocated trainers.
+        """
         return self.model_runner._sync_weights(updated_weights=updated_weights,
                                                mappings=mappings,
                                                transpose_keys=transpose_keys,
@@ -738,6 +749,10 @@ class TPUWorker(WorkerBase):
 
     def reinitialize_kv_cache(self) -> None:
         self.model_runner.reinitialize_kv_cache()
+
+    def shutdown(self) -> None:
+        self.shutdown_weight_transfer()
+        super().shutdown()
 
     def add_lora(self, lora_request: Any) -> bool:
         return self.model_runner.add_lora(lora_request)

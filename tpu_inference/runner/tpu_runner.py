@@ -53,6 +53,7 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 import tpu_inference.envs as envs
 from tpu_inference import utils as common_utils
 from tpu_inference.core.sched.utils import DEFAULT_MAX_DECODE_STEPS
+from tpu_inference.distributed.weight_transfer.base import ParamMeta
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, SharedAttentionMetadata)
 from tpu_inference.layers.common.sharding import (MESH_AXIS_NAMES,
@@ -3054,6 +3055,32 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             request, kv_cache_slices, block_ids)
 
     ###### RL framework integration ######
+
+    def get_weight_metadata(self) -> Dict[str, ParamMeta]:
+        """Describe the live model weights for a trainer.
+
+        Returns a mapping from dot-joined flat state path (the same key form
+        `transfer_state_with_mappings` matches against, e.g.
+        `layers.3.attn.q_proj.kernel`) to shape/dtype/sharding. A trainer uses
+        this to produce updates already laid out for this sampler's mesh.
+
+        Only the flax_nnx path is supported; the torchax path keeps weights as
+        a flat dict of torch parameter names and needs a separate key
+        convention.
+        """
+        state = self.state
+        if not isinstance(state, nnx.State):
+            raise NotImplementedError(
+                "get_weight_metadata() supports the flax_nnx model path only; "
+                f"got state of type {type(state).__name__}. The torchax path "
+                "is not implemented yet.")
+
+        metadata: Dict[str, ParamMeta] = {}
+        for keys, leaf in state.flat_state():
+            path = '.'.join(str(k) for k in keys)
+            value = leaf.get_value() if hasattr(leaf, "get_value") else leaf
+            metadata[path] = ParamMeta.from_array(value)
+        return metadata
 
     def _sync_weights(
         self,

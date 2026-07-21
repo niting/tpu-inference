@@ -208,11 +208,20 @@ setup_environment() {
     return 0
   fi
 
+  # Editable installs are reserved for local development, where run_in_docker.sh
+  # bind-mounts the working tree over the source baked into the image. CI images
+  # use regular installs so mounting /workspace cannot hide importable packages.
+  local editable_install="false"
+  if [[ "${DEV_MODE:-false}" == "true" ]]; then
+    editable_install="true"
+  fi
+
   # Build with specific hash and 'latest' tag for convenience
   docker build \
       --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
       --build-arg IS_TEST="true" \
       --build-arg BM_INFRA="${BM_INFRA:-false}" \
+      --build-arg EDITABLE_INSTALL="${editable_install}" \
       --no-cache -f docker/"${DOCKERFILE_NAME}" \
       -t "${IMAGE_NAME}:${TPU_INFERENCE_HASH}" \
       -t "${IMAGE_NAME}:latest" \

@@ -20,6 +20,7 @@ FROM $BASE_IMAGE
 
 ARG IS_TEST="false"
 ARG BM_INFRA="false"
+ARG EDITABLE_INSTALL="false"
 
 # Update pip
 RUN pip install --upgrade pip
@@ -63,10 +64,18 @@ RUN git clone $VLLM_REPO . && \
 
 RUN --mount=type=cache,target=/root/.cache/pip pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements/tpu.txt --retries 3
 RUN --mount=type=cache,target=/root/.cache/pip pip install setuptools-rust>=1.9.0
-RUN --mount=type=cache,target=/root/.cache/pip VLLM_TARGET_DEVICE="tpu" pip install --no-build-isolation -e .
+RUN --mount=type=cache,target=/root/.cache/pip if [ "$EDITABLE_INSTALL" = "true" ]; then \
+        VLLM_TARGET_DEVICE="tpu" pip install --no-build-isolation -e .; \
+    else \
+        VLLM_TARGET_DEVICE="tpu" pip install --no-build-isolation .; \
+    fi
 
 # Install test dependencies
-RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install -e tests/vllm_test_utils
+RUN --mount=type=cache,target=/root/.cache/pip if [ "$EDITABLE_INSTALL" = "true" ]; then \
+        python3 -m pip install -e tests/vllm_test_utils; \
+    else \
+        python3 -m pip install tests/vllm_test_utils; \
+    fi
 RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
     git+https://github.com/thuml/depyf.git \
     pytest-asyncio \
@@ -88,7 +97,11 @@ RUN  --mount=type=cache,target=/root/.cache/pip if [ "$IS_TEST" = "true" ]; then
         pip install -r requirements_test.txt --retries 3; \
     fi
 COPY . .
-RUN --mount=type=cache,target=/root/.cache/pip pip install -e .
+RUN --mount=type=cache,target=/root/.cache/pip if [ "$EDITABLE_INSTALL" = "true" ]; then \
+        pip install -e .; \
+    else \
+        pip install .; \
+    fi
 
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

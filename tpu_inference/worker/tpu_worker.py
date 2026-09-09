@@ -772,9 +772,19 @@ class TPUWorker(WorkerBase):
     def finish_weight_update(self) -> None:
         """Close the session and restore serving state."""
         self._weight_update_active = False
+        self.refresh_model_state_leaves()
         if self._kv_cache_freed:
             self.model_runner.reinitialize_kv_cache()
             self._kv_cache_freed = False
+
+    def refresh_model_state_leaves(self) -> None:
+        """Re-points the runner's dispatch view at the freshly synced weights.
+
+        `model_fn` takes `state_leaves` as its first argument; it is derived
+        from `state` at load time and goes stale once the weights behind
+        `state` are replaced.
+        """
+        self.model_runner.refresh_state_leaves()
 
     def delete_kv_cache(self) -> None:
         self.model_runner.delete_kv_cache()
